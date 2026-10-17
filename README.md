@@ -154,15 +154,17 @@ Any interleaving that double-filled an order, dropped a settlement, or committed
 
 | Path measured | Before (median orders/sec) | After (median orders/sec) |
 |---|---|---|
-| `OrderBook.submit` (price-time matching only) | ~4.3M | ~4.4M |
-| `OrderBook.submit` + 5-level depth snapshot | ~108K | ~2.6M |
-| `MatchingEngine` (queue handoff + engine thread + snapshot) | ~106K | ~1.46M |
+| `OrderBook.submit` (price-time matching only) | ~2.1M* | ~3.9M |
+| `OrderBook.submit` + 5-level depth snapshot | ~137K | ~2.1M |
+| `MatchingEngine` (queue handoff + engine thread + snapshot) | ~130K | ~1.39M |
 
-*Environment: OpenJDK 21.0.12, Linux x86-64, 2 vCPU cloud container; before and after measured on the same machine. Numbers vary by machine; run `./bench.sh` to reproduce.*
+*Environment: OpenJDK 23.0.2, macOS, Apple Silicon (aarch64), 8 cores; before and after measured on the same machine. Numbers vary by machine; run `./bench.sh` to reproduce.*
+
+\*The matching-only path is unaffected by this change; the lower "before" median comes from unusually high run-to-run variance in that measurement (min 0.6M, max 4.0M).
 
 **The bottleneck was the depth snapshot, not matching.** After every order the engine builds a snapshot of the top five levels per side. Originally, `OrderBook.levels()` summed the remaining quantity of every order at each of those levels. With this order flow, prices away from the mid never trade, so the book keeps growing and the top five levels can hold thousands of orders. Each snapshot therefore cost O(orders in the top levels) rather than O(levels).
 
-**Fix.** Each price level now keeps a running total of its open quantity, updated when an order rests, fills or is cancelled. A snapshot reads those totals, so it costs O(depth). End-to-end engine throughput rose about 14x. Both runs produce the same 779,162 trades from the same 1,000,000 orders, so matching behavior is unchanged. `EngineTest` checks after every step of a random fill-and-cancel sequence that each level's total equals the sum of its orders.
+**Fix.** Each price level now keeps a running total of its open quantity, updated when an order rests, fills or is cancelled. A snapshot reads those totals, so it costs O(depth). End-to-end engine throughput rose about 10x. Both versions produce the same 779,162 trades from the same 1,000,000 orders, so matching behavior is unchanged. `EngineTest` checks after every step of a random fill-and-cancel sequence that each level's total equals the sum of its orders.
 
 With the snapshot no longer dominant, the remaining gap between the engine path and matching alone is mostly the queue handoff between threads.
 
