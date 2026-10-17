@@ -1,0 +1,10 @@
+out/
+bin/
+*.class
+*.db
+*.mv.db
+*.trace.db
+.DS_Store
+.idea/
+*.iml
+.vscode/
