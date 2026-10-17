@@ -30,14 +30,25 @@ import java.util.TreeMap;
  * always firstEntry(). Each price level holds an ArrayDeque of orders in
  * arrival order, which gives time priority within a level for free: we always
  * consume from the head and always append to the tail.
+ *
+ * Each level also carries a running total of the open quantity resting on it,
+ * updated on rest, fill and cancel. A depth snapshot is taken after every
+ * order, and summing each order at a level would make that snapshot cost
+ * O(orders in the top levels); the running total makes it O(depth).
  */
 public class OrderBook {
 
     private final String symbol;
 
-    private final TreeMap<Long, ArrayDeque<Order>> bids =
+    /** One price level: orders in arrival order plus their total open quantity. */
+    private static final class PriceLevel {
+        final ArrayDeque<Order> orders = new ArrayDeque<>();
+        long totalQty;
+    }
+
+    private final TreeMap<Long, PriceLevel> bids =
             new TreeMap<>(Comparator.reverseOrder());
-    private final TreeMap<Long, ArrayDeque<Order>> asks =
+    private final TreeMap<Long, PriceLevel> asks =
             new TreeMap<>(Comparator.naturalOrder());
 
     /** Index of every resting order, so cancellation does not scan the book. */
@@ -65,11 +76,11 @@ public class OrderBook {
         List<Trade> trades = new ArrayList<>();
         List<Order> touched = new ArrayList<>();
         touched.add(incoming);
-        TreeMap<Long, ArrayDeque<Order>> opposite =
+        TreeMap<Long, PriceLevel> opposite =
                 (incoming.side() == Side.BUY) ? asks : bids;
 
         while (incoming.remaining() > 0 && !opposite.isEmpty()) {
-            Map.Entry<Long, ArrayDeque<Order>> best = opposite.firstEntry();
+            Map.Entry<Long, PriceLevel> best = opposite.firstEntry();
             long bestPrice = best.getKey();
 
             // A buy crosses when it is willing to pay at least the best ask;
@@ -81,13 +92,15 @@ public class OrderBook {
                 break;
             }
 
-            ArrayDeque<Order> queue = best.getValue();
+            PriceLevel level = best.getValue();
+            ArrayDeque<Order> queue = level.orders;
             while (incoming.remaining() > 0 && !queue.isEmpty()) {
                 Order resting = queue.peek();
                 long qty = Math.min(incoming.remaining(), resting.remaining());
 
                 incoming.reduceBy(qty);
                 resting.reduceBy(qty);
+                level.totalQty -= qty;
 
                 trades.add(buildTrade(incoming, resting, bestPrice, qty));
                 touched.add(resting);
@@ -118,9 +131,11 @@ public class OrderBook {
     }
 
     private void rest(Order order) {
-        TreeMap<Long, ArrayDeque<Order>> ownSide =
+        TreeMap<Long, PriceLevel> ownSide =
                 (order.side() == Side.BUY) ? bids : asks;
-        ownSide.computeIfAbsent(order.priceCents(), k -> new ArrayDeque<>()).addLast(order);
+        PriceLevel level = ownSide.computeIfAbsent(order.priceCents(), k -> new PriceLevel());
+        level.orders.addLast(order);
+        level.totalQty += order.remaining();
         restingById.put(order.id(), order);
     }
 
@@ -140,12 +155,12 @@ public class OrderBook {
                     + " may not cancel order " + orderId);
         }
 
-        TreeMap<Long, ArrayDeque<Order>> ownSide =
+        TreeMap<Long, PriceLevel> ownSide =
                 (order.side() == Side.BUY) ? bids : asks;
-        ArrayDeque<Order> queue = ownSide.get(order.priceCents());
-        if (queue != null) {
-            queue.remove(order);
-            if (queue.isEmpty()) {
+        PriceLevel level = ownSide.get(order.priceCents());
+        if (level != null && level.orders.remove(order)) {
+            level.totalQty -= order.remaining();
+            if (level.orders.isEmpty()) {
                 ownSide.remove(order.priceCents());
             }
         }
@@ -159,31 +174,51 @@ public class OrderBook {
         return new BookSnapshot(symbol, levels(bids, depth), levels(asks, depth));
     }
 
-    private List<BookSnapshot.Level> levels(TreeMap<Long, ArrayDeque<Order>> side, int depth) {
+    private List<BookSnapshot.Level> levels(TreeMap<Long, PriceLevel> side, int depth) {
         List<BookSnapshot.Level> out = new ArrayList<>();
-        for (Map.Entry<Long, ArrayDeque<Order>> e : side.entrySet()) {
+        for (Map.Entry<Long, PriceLevel> e : side.entrySet()) {
             if (out.size() == depth) {
                 break;
             }
-            long qty = 0;
-            for (Order o : e.getValue()) {
-                qty += o.remaining();
-            }
-            out.add(new BookSnapshot.Level(e.getKey(), qty, e.getValue().size()));
+            PriceLevel level = e.getValue();
+            out.add(new BookSnapshot.Level(e.getKey(), level.totalQty, level.orders.size()));
         }
         return out;
     }
 
-    /** Total open quantity resting on one side; used by the invariant tests. */
+    /**
+     * Total open quantity resting on one side; used by the invariant tests.
+     * Sums every order directly rather than trusting the per-level totals, so
+     * it serves as an independent check on them.
+     */
     public long openQuantity(Side side) {
-        TreeMap<Long, ArrayDeque<Order>> book = (side == Side.BUY) ? bids : asks;
+        TreeMap<Long, PriceLevel> book = (side == Side.BUY) ? bids : asks;
         long total = 0;
-        for (ArrayDeque<Order> queue : book.values()) {
-            for (Order o : queue) {
+        for (PriceLevel level : book.values()) {
+            for (Order o : level.orders) {
                 total += o.remaining();
             }
         }
         return total;
+    }
+
+    /**
+     * Test hook: true if every level's running total equals the sum of its
+     * orders' remaining quantities, on both sides.
+     */
+    boolean levelTotalsConsistent() {
+        for (TreeMap<Long, PriceLevel> side : List.of(bids, asks)) {
+            for (PriceLevel level : side.values()) {
+                long sum = 0;
+                for (Order o : level.orders) {
+                    sum += o.remaining();
+                }
+                if (sum != level.totalQty) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     public boolean isEmpty() {

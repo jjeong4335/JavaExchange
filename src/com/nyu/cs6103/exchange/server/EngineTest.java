@@ -34,6 +34,7 @@ public class EngineTest {
         testSweepsMultipleLevels();
         testCancelRemovesLiquidity();
         testCancelWrongUserRejected();
+        testLevelTotalsMatchOrders();
         testConcurrentRaceForSameQuantity();
 
         System.out.println();
@@ -220,6 +221,42 @@ public class EngineTest {
         check("ask side fully consumed", stillResting == 0);
         check("losers rest as bids, none vanish",
                 unfilledBids == threads * 10 - restingQty);
+    }
+
+    /**
+     * Snapshot quantities come from per-level running totals. Drive a random
+     * mix of crossing orders, partial fills and cancels, and check after every
+     * step that each total still equals the sum of its orders.
+     */
+    private static void testLevelTotalsMatchOrders() {
+        OrderBook book = new OrderBook("AAPL");
+        java.util.Random rnd = new java.util.Random(7);
+        List<Order> live = new ArrayList<>();
+        boolean consistent = true;
+        for (int i = 0; i < 20_000 && consistent; i++) {
+            if (!live.isEmpty() && rnd.nextInt(4) == 0) {
+                Order victim = live.remove(rnd.nextInt(live.size()));
+                book.cancel(victim.id(), victim.userId());
+            } else {
+                long price = 10000 + rnd.nextInt(21) - 10;
+                long qty = 1 + rnd.nextInt(100);
+                long user = 1 + rnd.nextInt(5);
+                Order o = rnd.nextBoolean() ? buy(user, price, qty) : sell(user, price, qty);
+                book.submit(o);
+                if (o.remaining() > 0) {
+                    live.add(o);
+                }
+            }
+            consistent = book.levelTotalsConsistent();
+        }
+        check("level totals match order sums after fills and cancels", consistent);
+
+        BookSnapshot snap = book.snapshot(Integer.MAX_VALUE);
+        long bidSnap = snap.bids().stream().mapToLong(BookSnapshot.Level::quantity).sum();
+        long askSnap = snap.asks().stream().mapToLong(BookSnapshot.Level::quantity).sum();
+        check("full-depth snapshot equals open quantity on both sides",
+                bidSnap == book.openQuantity(Side.BUY)
+                        && askSnap == book.openQuantity(Side.SELL));
     }
 
     // ---------- helpers ----------

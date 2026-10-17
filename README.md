@@ -109,11 +109,11 @@ N  session writer threads   one per connection, drains an outbound queue
 
 ## Testing
 
-Five harnesses, all plain `main` methods with no JUnit dependency. `./run.sh` runs all of them; 103 checks pass.
+Five harnesses, all plain `main` methods with no JUnit dependency. `./run.sh` runs all of them; 105 checks pass.
 
 | Harness | Checks | Covers |
 |---|---|---|
-| `server.EngineTest` | 34 | matching, priority, cancellation, 40-thread race |
+| `server.EngineTest` | 36 | matching, priority, cancellation, level-total consistency, 40-thread race |
 | `server.db.DbTest` | 21 | hashing, settlement, rollback under injected failure |
 | `server.NetworkTest` | 21 | full stack over real sockets, cancellation persistence, 20-client race |
 | `client.UiTest` | 22 | table models and chart painting, headless |
@@ -152,15 +152,19 @@ Any interleaving that double-filled an order, dropped a settlement, or committed
 
 `./bench.sh` runs `server.EngineBenchmark`, a plain-`main` throughput benchmark of the matching core. Networking and the database are not included. Each round submits 1,000,000 pre-generated orders for one instrument with a fixed random seed: 50/50 buy and sell, limit prices uniform within ±0.50 of 100.00, quantity 1–100. About 78% of orders produce at least one trade. There are 5 warm-up rounds, then the median of 10 measured rounds is reported.
 
-| Path measured | Median orders/sec | Range |
+| Path measured | Before (median orders/sec) | After (median orders/sec) |
 |---|---|---|
-| `OrderBook.submit` (price-time matching only) | ~3.2M | 2.7M – 3.8M |
-| `OrderBook.submit` + 5-level depth snapshot | ~96K | 76K – 110K |
-| `MatchingEngine` (queue handoff + engine thread + snapshot) | ~84K | 76K – 95K |
+| `OrderBook.submit` (price-time matching only) | ~4.3M | ~4.4M |
+| `OrderBook.submit` + 5-level depth snapshot | ~108K | ~2.6M |
+| `MatchingEngine` (queue handoff + engine thread + snapshot) | ~106K | ~1.46M |
 
-*Environment: OpenJDK 21.0.12, Linux x86-64, 2 vCPU cloud container. Numbers vary by machine; run `./bench.sh` to reproduce.*
+*Environment: OpenJDK 21.0.12, Linux x86-64, 2 vCPU cloud container; before and after measured on the same machine. Numbers vary by machine; run `./bench.sh` to reproduce.*
 
-**Reading the results.** Matching is not the bottleneck; the depth snapshot is. After every order the engine builds a snapshot of the top five levels per side, and `OrderBook.levels()` sums the remaining quantity of every order at each of those levels. With this order flow, prices away from the mid never trade, so the book keeps growing, and the top five levels can hold thousands of orders. Each snapshot therefore costs O(orders in the top levels) rather than O(levels). Keeping a running total quantity per price level, updated on rest, fill and cancel, would make the snapshot O(depth) and bring the engine path much closer to the matching-only figure. The queue handoff between threads adds comparatively little.
+**The bottleneck was the depth snapshot, not matching.** After every order the engine builds a snapshot of the top five levels per side. Originally, `OrderBook.levels()` summed the remaining quantity of every order at each of those levels. With this order flow, prices away from the mid never trade, so the book keeps growing and the top five levels can hold thousands of orders. Each snapshot therefore cost O(orders in the top levels) rather than O(levels).
+
+**Fix.** Each price level now keeps a running total of its open quantity, updated when an order rests, fills or is cancelled. A snapshot reads those totals, so it costs O(depth). End-to-end engine throughput rose about 14x. Both runs produce the same 779,162 trades from the same 1,000,000 orders, so matching behavior is unchanged. `EngineTest` checks after every step of a random fill-and-cancel sequence that each level's total equals the sum of its orders.
+
+With the snapshot no longer dominant, the remaining gap between the engine path and matching alone is mostly the queue handoff between threads.
 
 ---
 
