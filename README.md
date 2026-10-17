@@ -148,6 +148,22 @@ Any interleaving that double-filled an order, dropped a settlement, or committed
 
 ---
 
+## Performance
+
+`./bench.sh` runs `server.EngineBenchmark`, a plain-`main` throughput benchmark of the matching core. Networking and the database are not included. Each round submits 1,000,000 pre-generated orders for one instrument with a fixed random seed: 50/50 buy and sell, limit prices uniform within ±0.50 of 100.00, quantity 1–100. About 78% of orders produce at least one trade. There are 5 warm-up rounds, then the median of 10 measured rounds is reported.
+
+| Path measured | Median orders/sec | Range |
+|---|---|---|
+| `OrderBook.submit` (price-time matching only) | ~3.2M | 2.7M – 3.8M |
+| `OrderBook.submit` + 5-level depth snapshot | ~96K | 76K – 110K |
+| `MatchingEngine` (queue handoff + engine thread + snapshot) | ~84K | 76K – 95K |
+
+*Environment: OpenJDK 21.0.12, Linux x86-64, 2 vCPU cloud container. Numbers vary by machine; run `./bench.sh` to reproduce.*
+
+**Reading the results.** Matching is not the bottleneck; the depth snapshot is. After every order the engine builds a snapshot of the top five levels per side, and `OrderBook.levels()` sums the remaining quantity of every order at each of those levels. With this order flow, prices away from the mid never trade, so the book keeps growing, and the top five levels can hold thousands of orders. Each snapshot therefore costs O(orders in the top levels) rather than O(levels). Keeping a running total quantity per price level, updated on rest, fill and cancel, would make the snapshot O(depth) and bring the engine path much closer to the matching-only figure. The queue handoff between threads adds comparatively little.
+
+---
+
 ## Changes from the proposal
 
 The wire protocol is line-delimited text rather than JSON, which removed a dependency and made the server drivable by `telnet`. The schema moved from a classpath resource into `Db`, for the reason given above. `SimBot` and `SimBotTest` were added: a market that only moves when a human clicks a button is a poor demonstration of concurrency, and the conservation test the bots enable turned out to be the most valuable check in the suite. Pre-trade risk checks were added to reduce avoidable settlement failures, once it became clear that publication happens before asynchronous settlement and a failure at that point has no clean recovery. They narrow the window rather than closing it; the residual race is described under Limitations.
